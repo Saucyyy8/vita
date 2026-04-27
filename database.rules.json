@@ -1,0 +1,36 @@
+{
+  "rules": {
+    "infrastructure": {
+      ".read": "auth != null",
+      "factories": {
+        ".indexOn": ["status"],
+        ".write": "auth != null && auth.token.admin === true"
+      },
+      "cold_storage": {
+        ".indexOn": ["status"],
+        ".write": "auth != null && auth.token.admin === true"
+      }
+    },
+    "trips": {
+      ".indexOn": ["truck_id", "status"],
+      ".read": "auth != null",
+      ".write": false
+    },
+    "events": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "devices": {
+      ".read": true,
+      ".write": false
+    },
+    "factory_monitors": {
+      ".read": "auth != null",
+      ".write": "auth != null"
+    },
+    "agent_log": {
+      ".read": "auth != null",
+      ".write": false
+    }
+  }
+}
