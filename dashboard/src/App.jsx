@@ -33,15 +33,20 @@ function Sidebar() {
   ];
 
   return (
-    <div className="glass-panel" style={{ width: '250px', display: 'flex', flexDirection: 'column', padding: '1.5rem', margin: '1rem' }}>
+    <div style={{ 
+      width: '220px', minWidth: '220px', display: 'flex', flexDirection: 'column', 
+      padding: '1.5rem', margin: '0', 
+      background: '#0f172a', borderRight: '1px solid rgba(255,255,255,0.08)',
+      height: '100vh', position: 'sticky', top: 0
+    }}>
       <div style={{ marginBottom: '2rem' }}>
-        <h2 style={{ background: 'linear-gradient(to right, #60a5fa, #a78bfa)', WebkitBackgroundClip: 'text', color: 'transparent', fontWeight: 'bold' }}>
+        <h2 style={{ background: 'linear-gradient(to right, #60a5fa, #a78bfa)', WebkitBackgroundClip: 'text', color: 'transparent', fontWeight: 'bold', fontSize: '1.2rem' }}>
           VITA Admin
         </h2>
-        <div className="badge success" style={{ display: 'inline-block', marginTop: '0.5rem' }}>Secured</div>
+        <div style={{ display: 'inline-block', marginTop: '0.5rem', padding: '0.2rem 0.6rem', borderRadius: '9999px', fontSize: '0.65rem', fontWeight: 600, background: 'rgba(34,197,94,0.15)', color: '#22c55e' }}>SECURED</div>
       </div>
 
-      <nav style={{ flexGrow: 1, display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+      <nav style={{ flexGrow: 1, display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
         {navItems.map((item) => {
           const Icon = item.icon;
           const isActive = location.pathname === item.path;
@@ -50,22 +55,28 @@ function Sidebar() {
               key={item.path}
               to={item.path}
               style={{
-                display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.75rem 1rem',
-                borderRadius: '8px', textDecoration: 'none',
+                display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.7rem 0.85rem',
+                borderRadius: '8px', textDecoration: 'none', fontSize: '0.85rem',
                 background: isActive ? 'rgba(59, 130, 246, 0.2)' : 'transparent',
-                color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+                color: isActive ? '#60a5fa' : '#94a3b8',
                 transition: 'all 0.2s', fontWeight: isActive ? '600' : '500'
               }}
             >
-              <Icon size={20} />
+              <Icon size={18} />
               {item.label}
             </Link>
           );
         })}
       </nav>
 
-      <button onClick={handleLogout} className="btn-ghost" style={{ width: '100%', justifyContent: 'flex-start', color: 'var(--danger)' }}>
-        <LogOut size={20} /> Logout
+      <button onClick={handleLogout} style={{ 
+        width: '100%', display: 'flex', alignItems: 'center', gap: '0.5rem',
+        justifyContent: 'flex-start', color: '#ef4444', background: 'transparent',
+        border: '1px solid rgba(239,68,68,0.2)', borderRadius: '8px', 
+        padding: '0.7rem 0.85rem', cursor: 'pointer', fontSize: '0.85rem', fontWeight: 500,
+        fontFamily: 'var(--font-family)'
+      }}>
+        <LogOut size={18} /> Logout
       </button>
     </div>
   );
@@ -95,7 +106,7 @@ export default function App() {
             <Route 
               path="/infrastructure" 
               element={
-                <ProtectedRoute adminOnly={true}>
+                <ProtectedRoute adminOnly={false}>
                   <InfraPage />
                 </ProtectedRoute>
               } 
@@ -103,7 +114,7 @@ export default function App() {
             <Route 
               path="/trips/create" 
               element={
-                <ProtectedRoute adminOnly={true}>
+                <ProtectedRoute adminOnly={false}>
                   <CreateTripPage />
                 </ProtectedRoute>
               } 
@@ -111,7 +122,7 @@ export default function App() {
             <Route 
               path="/chaos" 
               element={
-                <ProtectedRoute adminOnly={true}>
+                <ProtectedRoute adminOnly={false}>
                   <ChaosPage />
                 </ProtectedRoute>
               } 
@@ -119,7 +130,7 @@ export default function App() {
             <Route 
               path="/simulations" 
               element={
-                <ProtectedRoute adminOnly={true}>
+                <ProtectedRoute adminOnly={false}>
                   <SimulationPage />
                 </ProtectedRoute>
               } 

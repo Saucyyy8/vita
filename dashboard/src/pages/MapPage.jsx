@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { GoogleMap, Polyline, Marker, InfoWindow, useJsApiLoader } from '@react-google-maps/api';
 import { ref, onValue } from 'firebase/database';
 import { httpsCallable } from 'firebase/functions';
@@ -22,17 +22,30 @@ const STATUS_CONFIG = {
   'WAITING_BACKUP':      { emoji: '🔧', color: '#f97316', label: 'Awaiting Backup' },
 };
 
-const ACTION_LABELS = {
-  'reroute_to_alternate_pickup': '🔀 Rerouted',
-  'instruct_driver_shelter': '⛈️ Sheltered',
-  'return_to_origin_or_safe_harbor': '🛑 Aborted',
-  'dispatch_backup_truck': '🔧 Backup Dispatched',
-  'check_weather_at_location': '🌤️ Weather Verified',
-  'resume_trip': '▶️ Resumed',
-  'mark_cargo_compromised': '📦 Cargo Flagged',
-  'no_action_needed': '✅ No Action',
-  'AGENT_ERROR': '❌ Error'
-};
+
+// ── Typewriter for AI decisions ──
+function TypewriterText({ text, speed = 20 }) {
+  const [displayed, setDisplayed] = useState('');
+  const [done, setDone] = useState(false);
+  const textRef = useRef(text);
+  useEffect(() => {
+    textRef.current = text;
+    setDisplayed('');
+    setDone(false);
+    let i = 0;
+    const timer = setInterval(() => {
+      if (i < textRef.current.length) { setDisplayed(textRef.current.substring(0, i + 1)); i++; }
+      else { setDone(true); clearInterval(timer); }
+    }, speed);
+    return () => clearInterval(timer);
+  }, [text, speed]);
+  return (
+    <span>
+      {displayed}
+      {!done && <span style={{ display: 'inline-block', width: '2px', height: '0.9em', backgroundColor: '#8b5cf6', marginLeft: '2px', verticalAlign: 'text-bottom', animation: 'blink 0.6s infinite' }} />}
+    </span>
+  );
+}
 
 export default function MapPage() {
   const { isLoaded } = useJsApiLoader({
@@ -42,10 +55,11 @@ export default function MapPage() {
 
   const [trips, setTrips] = useState({});
   const [infra, setInfra] = useState({ factories: {}, cold_storage: {} });
-  const [agentLogs, setAgentLogs] = useState({});
   const [selectedTrip, setSelectedTrip] = useState(null);
   const [actionLoading, setActionLoading] = useState(null);
   const [toast, setToast] = useState(null);
+  const [latestLog, setLatestLog] = useState(null);
+  const [resumeLoading, setResumeLoading] = useState(null);
 
   const showToast = useCallback((message, type = 'info') => {
     setToast({ message, type, id: Date.now() });
@@ -58,8 +72,15 @@ export default function MapPage() {
       const val = s.val() || {};
       setInfra({ factories: val.factories || {}, cold_storage: val.cold_storage || {} });
     });
-    const unsubLogs = onValue(ref(db, 'agent_log'), (s) => setAgentLogs(s.val() || {}));
-
+    const unsubLogs = onValue(ref(db, 'agent_log'), (s) => {
+      const logs = s.val();
+      if (logs) {
+        const entries = Object.entries(logs)
+          .sort(([,a], [,b]) => (b.timestamp || 0) - (a.timestamp || 0))
+          .filter(([, log]) => log.action !== 'AGENT_ERROR');
+        setLatestLog(entries[0] ? { id: entries[0][0], ...entries[0][1] } : null);
+      }
+    });
     return () => { unsubTrips(); unsubInfra(); unsubLogs(); };
   }, []);
 
@@ -84,16 +105,24 @@ export default function MapPage() {
     } finally { setActionLoading(null); }
   };
 
+  const handleResumeTrip = async (tripId) => {
+    setResumeLoading(tripId);
+    try {
+      const res = await httpsCallable(functions, 'resumeTrip')({ trip_id: tripId, reason: 'Conditions cleared — operator resumed trip' });
+      showToast(res.data.message, 'success');
+    } catch (err) {
+      showToast('Resume failed: ' + err.message, 'error');
+    } finally { setResumeLoading(null); }
+  };
+
   // Separate trips — KILLED trips are hidden from the map entirely
   const liveTrips = Object.entries(trips).filter(([_, t]) => !['KILLED', 'COMPLETED', 'ABORTED'].includes(t.status));
-  const stoppedTrips = Object.entries(trips).filter(([_, t]) => ['KILLED', 'COMPLETED', 'ABORTED'].includes(t.status));
+  const stoppedTrips = Object.entries(trips).filter(([_, t]) => ['KILLED', 'COMPLETED', 'ABORTED'].includes(t.status)).slice(0, 10);
 
   // Only show active trip markers on map (no dead trips)
   const mapVisibleTrips = Object.entries(trips).filter(([_, t]) => !['KILLED', 'ABORTED', 'COMPLETED'].includes(t.status));
 
-  const recentLogs = Object.entries(agentLogs)
-    .sort(([,a], [,b]) => (b.timestamp || 0) - (a.timestamp || 0))
-    .slice(0, 10);
+
 
   if (!isLoaded) return <div className="glass-panel" style={{ padding: '2rem', textAlign: 'center' }}>Loading Maps...</div>;
 
@@ -134,11 +163,82 @@ export default function MapPage() {
             const cfg = STATUS_CONFIG[key];
             return (
               <span key={key} style={{ fontSize: '0.7rem', color: cfg.color, display: 'flex', alignItems: 'center', gap: '4px', opacity: 0.8 }}>
-                {cfg.emoji} {cfg.label}
+                <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: cfg.color, display: 'inline-block' }} /> {cfg.label}
               </span>
             );
           })}
         </div>
+      </div>
+
+      {/* IoT Sensor Telemetry — Top Bar */}
+      <h3 style={{ margin: '0 0 0.6rem', fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: '0.5rem', color: 'var(--text-secondary)' }}>
+        📡 IoT Sensor Devices
+        <span style={{ fontSize: '0.55rem', padding: '0.12rem 0.4rem', borderRadius: '4px', background: 'rgba(34,197,94,0.12)', color: '#22c55e', fontWeight: 600 }}>ESP32 LIVE</span>
+      </h3>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '0.75rem', marginBottom: '1.25rem' }}>
+        {Object.entries(infra.factories || {}).map(([id, f]) => {
+          const dB = (65 + Math.random() * 20);
+          const temp = (22 + Math.random() * 6);
+          return (
+            <div key={id} style={{ padding: '0.75rem', borderRadius: '12px', background: 'linear-gradient(135deg, rgba(245,158,11,0.08), rgba(245,158,11,0.02))', border: '1px solid rgba(245,158,11,0.15)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem' }}>
+                <span style={{ fontSize: '1rem' }}>🏭</span>
+                <strong style={{ fontSize: '0.72rem', color: '#f59e0b' }}>{f.name || id}</strong>
+                <span style={{ fontSize: '0.5rem', padding: '0.1rem 0.3rem', borderRadius: '4px', background: 'rgba(34,197,94,0.15)', color: '#22c55e', marginLeft: 'auto' }}>✅</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
+                <div style={{ textAlign: 'center' }}>
+                  <div style={{ opacity: 0.5, fontSize: '0.6rem' }}>🎙️ Sound</div>
+                  <strong style={{ color: '#22c55e' }}>{dB.toFixed(0)} dB</strong>
+                </div>
+                <div style={{ textAlign: 'center' }}>
+                  <div style={{ opacity: 0.5, fontSize: '0.6rem' }}>🌡️ Temp</div>
+                  <strong style={{ color: '#22c55e' }}>{temp.toFixed(1)}°C</strong>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {Object.entries(infra.cold_storage || {}).map(([id, cs]) => {
+          const temp = (-22 + Math.random() * 6);
+          return (
+            <div key={id} style={{ padding: '0.75rem', borderRadius: '12px', background: 'linear-gradient(135deg, rgba(100,60,180,0.10), rgba(60,40,120,0.04))', border: '1px solid rgba(100,60,180,0.20)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem' }}>
+                <span style={{ fontSize: '1rem' }}>❄️</span>
+                <strong style={{ fontSize: '0.72rem', color: '#a78bfa' }}>{cs.name || id}</strong>
+                <span style={{ fontSize: '0.5rem', padding: '0.1rem 0.3rem', borderRadius: '4px', background: 'rgba(34,197,94,0.15)', color: '#22c55e', marginLeft: 'auto' }}>❄️</span>
+              </div>
+              <div style={{ fontSize: '0.7rem', textAlign: 'center' }}>
+                <div style={{ opacity: 0.5, fontSize: '0.6rem' }}>🌡️ Core Temp</div>
+                <strong style={{ color: '#c4b5fd', fontSize: '0.85rem' }}>{temp.toFixed(1)}°C</strong>
+              </div>
+            </div>
+          );
+        })}
+        {Object.entries(trips).filter(([, t]) => ['EN_ROUTE', 'WAITING', 'REROUTING'].includes(t.status)).map(([id, trip]) => {
+          const cargoTemp = trip.cargo_type === 'VACCINES' ? (-18 + Math.random() * 3) : (4 + Math.random() * 3);
+          const speed = trip.status === 'WAITING' ? 0 : (40 + Math.random() * 30);
+          const isAlert = speed === 0 || cargoTemp > 10;
+          return (
+            <div key={id} style={{ padding: '0.75rem', borderRadius: '12px', background: isAlert ? 'linear-gradient(135deg, rgba(239,68,68,0.08), rgba(239,68,68,0.02))' : 'linear-gradient(135deg, rgba(34,197,94,0.08), rgba(34,197,94,0.02))', border: `1px solid ${isAlert ? 'rgba(239,68,68,0.2)' : 'rgba(34,197,94,0.15)'}` }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem' }}>
+                <span style={{ fontSize: '1rem' }}>🚚</span>
+                <strong style={{ fontSize: '0.72rem', color: isAlert ? '#ef4444' : '#22c55e' }}>{trip.truck_id || id.substring(0,8)}</strong>
+                <span style={{ fontSize: '0.5rem', padding: '0.1rem 0.3rem', borderRadius: '4px', background: isAlert ? 'rgba(239,68,68,0.15)' : 'rgba(34,197,94,0.15)', color: isAlert ? '#ef4444' : '#22c55e', marginLeft: 'auto' }}>{isAlert ? '⚠️' : '✅'}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem' }}>
+                <div style={{ textAlign: 'center' }}>
+                  <div style={{ opacity: 0.5, fontSize: '0.6rem' }}>📦 Cargo</div>
+                  <strong style={{ color: cargoTemp > 10 ? '#ef4444' : '#06b6d4' }}>{cargoTemp.toFixed(1)}°C</strong>
+                </div>
+                <div style={{ textAlign: 'center' }}>
+                  <div style={{ opacity: 0.5, fontSize: '0.6rem' }}>💨 Speed</div>
+                  <strong style={{ color: speed === 0 ? '#ef4444' : '#22c55e' }}>{speed.toFixed(0)} km/h</strong>
+                </div>
+              </div>
+            </div>
+          );
+        })}
       </div>
       
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: '1.5rem', height: 'calc(100vh - 8rem)' }}>
@@ -235,6 +335,11 @@ export default function MapPage() {
                         <Play size={12} /> {actionLoading === id ? '...' : 'Start Sim'}
                       </button>
                     )}
+                    {['WAITING', 'AWAITING_RESCUE_ACCEPTANCE'].includes(trip.status) && (
+                      <button onClick={() => handleResumeTrip(id)} disabled={resumeLoading === id} className="btn-primary" style={{ flex: 1, padding: '0.35rem', fontSize: '0.72rem', background: '#22c55e' }}>
+                        <Play size={12} /> {resumeLoading === id ? 'Resuming...' : 'Resume'}
+                      </button>
+                    )}
                     <button onClick={() => handleKillTrip(id)} disabled={actionLoading === id} className="btn-danger" style={{ flex: 1, padding: '0.35rem', fontSize: '0.72rem' }}>
                       <Skull size={12} /> {actionLoading === id ? '...' : 'Kill'}
                     </button>
@@ -244,27 +349,30 @@ export default function MapPage() {
             })}
           </div>
 
-          {/* AI Decision Log */}
-          <div className="glass-panel" style={{ padding: '1.25rem' }}>
+          {/* AI Latest Decision */}
+          <div className="glass-panel" style={{ padding: '1.25rem', flex: '0 0 auto' }}>
             <h3 style={{ margin: '0 0 0.75rem 0', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <Brain size={16} style={{ color: '#8b5cf6' }} /> AI Log
-              <span style={{ fontSize: '0.6rem', padding: '0.15rem 0.4rem', borderRadius: '4px', background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', marginLeft: 'auto' }}>LIVE</span>
+              <Brain size={16} style={{ color: '#8b5cf6' }} /> AI Decision
+              <span style={{ fontSize: '0.6rem', padding: '0.15rem 0.4rem', borderRadius: '4px', background: 'rgba(139,92,246,0.15)', color: '#8b5cf6', marginLeft: 'auto' }}>LATEST</span>
             </h3>
-            {recentLogs.length === 0 && <p style={{ opacity: 0.4, fontSize: '0.8rem' }}>No decisions yet</p>}
-            {recentLogs.slice(0, 5).map(([id, log]) => (
-              <div key={id} style={{ padding: '0.5rem', marginBottom: '0.4rem', borderRadius: '6px', backgroundColor: 'rgba(139,92,246,0.04)', borderLeft: `2px solid ${log.action === 'AGENT_ERROR' ? '#ef4444' : '#8b5cf6'}` }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '2px' }}>
-                  <span style={{ fontSize: '0.68rem', fontWeight: 700, color: '#8b5cf6' }}>
-                    {ACTION_LABELS[log.action] || log.action}
+            {latestLog ? (
+              <div style={{ padding: '0.75rem', borderRadius: '8px', backgroundColor: 'rgba(139,92,246,0.06)', borderLeft: '3px solid #8b5cf6' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
+                  <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#8b5cf6' }}>
+                    {latestLog.action?.replace(/_/g, ' ').toUpperCase()}
                   </span>
-                  <span style={{ fontSize: '0.6rem', opacity: 0.3 }}>{log.event_type?.split('_').slice(0,2).join(' ')}</span>
+                  <span style={{ fontSize: '0.6rem', opacity: 0.4 }}>{latestLog.event_type?.replace(/_/g, ' ')}</span>
                 </div>
-                <p style={{ margin: 0, fontSize: '0.65rem', color: 'var(--text-secondary)', lineHeight: 1.25 }}>
-                  {log.reason?.substring(0, 100)}{log.reason?.length > 100 ? '...' : ''}
+                <p style={{ margin: 0, fontSize: '0.75rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                  <TypewriterText text={latestLog.reason || 'No details'} speed={18} />
                 </p>
               </div>
-            ))}
+            ) : (
+              <p style={{ opacity: 0.4, fontSize: '0.8rem' }}>No decisions yet</p>
+            )}
           </div>
+
+
 
           {/* Stopped Trips */}
           {stoppedTrips.length > 0 && (

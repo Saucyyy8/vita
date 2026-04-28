@@ -12,8 +12,8 @@ if (admin.apps.length === 0) {
 
 const db = admin.database();
 
-const MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyDLx8hwg2Zmh-llqTZA2UMOTbmDM0YhJBs';
-const WEATHER_API_KEY = process.env.OPENWEATHER_API_KEY || 'a90d0db3b6c329df004bf206b915369e';
+const MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
+const WEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
 
 /** ==========================================
  *  1. SENSOR INGEST & TELEMETRY
@@ -82,27 +82,30 @@ exports.getInfrastructure = onCall({ cors: true }, async (request) => {
  *  1.5.1 AEGIS SUPPLY CHAIN SIMULATION — ROUTE EXPLANATION
  *  ========================================== */
 exports.explainRoute = onCall({ cors: true }, async (request) => {
-  const { path: routePath, risk, caseType } = request.data;
+  const { path: routePath, risk, caseType, co2_kg, distance_km } = request.data;
   if (!routePath || routePath.length === 0) {
     throw new HttpsError('invalid-argument', 'path is required.');
   }
 
-  const prompt = `You are an expert in supply chain risk analysis for the ${caseType || 'global'} sector.
+  const prompt = `You are an expert in supply chain risk AND sustainability analysis for the ${caseType || 'global'} sector.
 
-Compare this route with alternatives and explain WHY it is the optimal choice.
+Analyze this route and explain WHY it is the optimal choice, factoring in BOTH risk AND carbon footprint.
 
 Path: ${routePath.join(' → ')}
 Risk Score: ${(risk || 0).toFixed(2)}
+Distance: ${distance_km || 'N/A'} km
+CO2 Emission: ${co2_kg || 'N/A'} kg (using 0.9 kg/km emission factor for heavy-duty diesel trucks)
 
 Requirements:
 - Mention specific nodes (factories, hubs, suppliers) by name
 - Identify which node reduces or increases risk
-- Explain why alternative paths would be worse
+- Compare the carbon footprint against likely alternatives (longer routes = more CO2)
+- If this is the greenest route, highlight the CO2 savings (SDG 13 Climate Action alignment)
 - Be concrete and data-driven, no vague statements
 - Maximum 4 sentences`;
 
   try {
-    const generativeModel = vertexAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const generativeModel = vertexAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const result = await generativeModel.generateContent({
       contents: [{ role: "user", parts: [{ text: prompt }] }]
     });
@@ -114,6 +117,79 @@ Requirements:
       `Node "${routePath[Math.floor(routePath.length / 2)]}" acts as a stable intermediary, ` +
       `reducing risk propagation compared to higher-risk alternatives.`;
     return { path: routePath, risk, explanation: fallback };
+  }
+});
+
+/** ==========================================
+ *  1.5.2 APPLY SIMULATION ROUTE TO LIVE FLEET
+ *  ========================================== */
+exports.applySimulationRoute = onCall({ cors: true }, async (request) => {
+  const { trip_id, recommended_path, risk, co2_kg, destination_lat, destination_lng, destination_name } = request.data;
+  if (!trip_id) throw new HttpsError('invalid-argument', 'trip_id is required.');
+  if (!destination_lat || !destination_lng) throw new HttpsError('invalid-argument', 'destination coordinates required.');
+
+  try {
+    const tripSnap = await db.ref(`/trips/${trip_id}`).get();
+    if (!tripSnap.exists()) throw new HttpsError('not-found', 'Trip not found.');
+    const trip = tripSnap.val();
+
+    if (!['EN_ROUTE', 'WAITING', 'PENDING_DRIVER_START'].includes(trip.status)) {
+      throw new HttpsError('failed-precondition', `Cannot apply route to trip with status ${trip.status}`);
+    }
+
+    // Use Google Routes API to compute actual polyline
+    const origin = trip.current_location || { lat: trip.waypoints?.[0]?.lat, lng: trip.waypoints?.[0]?.lng };
+    const routeRes = await axios.post(
+      'https://routes.googleapis.com/directions/v2:computeRoutes',
+      {
+        origin: { location: { latLng: { latitude: parseFloat(origin.lat), longitude: parseFloat(origin.lng) } } },
+        destination: { location: { latLng: { latitude: parseFloat(destination_lat), longitude: parseFloat(destination_lng) } } },
+        travelMode: 'DRIVE',
+        routingPreference: 'TRAFFIC_AWARE'
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': MAPS_API_KEY,
+          'X-Goog-FieldMask': 'routes.polyline.encodedPolyline,routes.distanceMeters,routes.duration'
+        }
+      }
+    );
+
+    const route = routeRes.data?.routes?.[0];
+    if (!route) throw new HttpsError('internal', 'Google Routes API returned no route.');
+
+    // Update the trip with new route
+    await db.ref(`/trips/${trip_id}`).update({
+      encoded_polyline: route.polyline.encodedPolyline,
+      status: trip.status === 'WAITING' ? 'EN_ROUTE' : trip.status,
+      destination: { lat: parseFloat(destination_lat), lng: parseFloat(destination_lng), name: destination_name || 'Simulation Target' },
+      last_agent_decision: {
+        action: 'SIMULATION_OVERRIDE',
+        reason: `Operator applied simulation-recommended route. Path: ${(recommended_path || []).join(' → ')}. Risk: ${(risk || 0).toFixed(2)}. CO2: ${co2_kg || 'N/A'}kg.`,
+        timestamp: Date.now()
+      },
+      simulation_applied_at: admin.database.ServerValue.TIMESTAMP
+    });
+
+    // Log in agent audit trail
+    await db.ref('/agent_log').push({
+      trip_id,
+      action: 'SIMULATION_OVERRIDE',
+      event_type: 'MANUAL_SIMULATION_APPLY',
+      reason: `Simulation route applied by operator. Recommended path: ${(recommended_path || []).join(' → ')}. Risk score: ${(risk || 0).toFixed(2)}. Estimated CO2: ${co2_kg || 'N/A'}kg.`,
+      timestamp: admin.database.ServerValue.TIMESTAMP
+    });
+
+    return {
+      success: true,
+      message: `Route applied to ${trip.truck_id}. New polyline loaded with ${route.distanceMeters}m distance.`,
+      distance_meters: route.distanceMeters
+    };
+  } catch (err) {
+    if (err.code && err.httpErrorCode) throw err;
+    console.error('[applySimulationRoute] Error:', err.message);
+    throw new HttpsError('internal', err.message);
   }
 });
 
@@ -557,6 +633,42 @@ exports.masterAgent = onValueCreated("/events/{eventId}", async (event) => {
       }
     }
 
+    // For infrastructure events (cold storage/factory failure), find trips heading to that facility
+    if (!resolvedTrip && (eventData.cold_storage_id || eventData.factory_id)) {
+      const targetInfraId = eventData.cold_storage_id || eventData.factory_id;
+      const infraType = eventData.cold_storage_id ? 'cold_storage' : 'factories';
+      const infraSnap = await db.ref(`/infrastructure/${infraType}/${targetInfraId}`).get();
+      const infraNode = infraSnap.exists() ? infraSnap.val() : null;
+
+      if (infraNode && allTripsSnap.exists()) {
+        const activeTrips = Object.entries(allTripsSnap.val())
+          .filter(([_, t]) => ['EN_ROUTE', 'WAITING', 'PENDING_DRIVER_START'].includes(t.status));
+        
+        // Find trip heading nearest to the affected facility
+        for (const [tid, t] of activeTrips) {
+          const dest = t.waypoints?.[t.waypoints?.length - 1] || t.destination;
+          if (dest) {
+            const dLat = Math.abs((dest.lat || 0) - infraNode.lat);
+            const dLng = Math.abs((dest.lng || 0) - infraNode.lng);
+            if (dLat < 0.01 && dLng < 0.01) { // ~1km proximity
+              resolvedTripId = tid;
+              resolvedTrip = t;
+              break;
+            }
+          }
+          // Also check if current location is heading toward facility (within 50km)
+          if (!resolvedTrip && t.current_location) {
+            const dLat2 = Math.abs(t.current_location.lat - infraNode.lat);
+            const dLng2 = Math.abs(t.current_location.lng - infraNode.lng);
+            if (dLat2 < 0.5 && dLng2 < 0.5) {
+              resolvedTripId = tid;
+              resolvedTrip = t;
+            }
+          }
+        }
+      }
+    }
+
     const allFactories = facSnap.val() || {};
     const allColdStorages = csSnap.val() || {};
     const allTrips = allTripsSnap.val() || {};
@@ -637,7 +749,7 @@ RULES: Call exactly ONE tool. Use real facility IDs from INFRASTRUCTURE only. Gi
 `;
 
     // 4. Call Gemini with retry for rate limiting
-    const generativeModel = vertexAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const generativeModel = vertexAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     
     let result;
     const MAX_RETRIES = 3;
@@ -788,11 +900,17 @@ async function executeReroute(db, tripId, newDestId, reason) {
 
     const origin = trip.current_location;
     let dest;
+    let destName = newDestId;
     const facSnap = await db.ref(`/infrastructure/factories/${newDestId}`).get();
-    if (facSnap.exists()) dest = facSnap.val();
-    else {
+    if (facSnap.exists()) {
+      dest = facSnap.val();
+      destName = dest.name || newDestId;
+    } else {
       const csSnap = await db.ref(`/infrastructure/cold_storage/${newDestId}`).get();
-      if (csSnap.exists()) dest = csSnap.val();
+      if (csSnap.exists()) {
+        dest = csSnap.val();
+        destName = dest.name || newDestId;
+      }
     }
 
     if (!dest) {
@@ -819,17 +937,21 @@ async function executeReroute(db, tripId, newDestId, reason) {
     );
 
     const route = response.data.routes[0];
-    // We update the encoded_polyline. The simulator watches for EN_ROUTE and will 
-    // pick up the NEW path from the NEW currentIndex 0.
+    // Update trip with new route — simulator will detect encoded_polyline change and follow it
     await db.ref(`/trips/${tripId}`).update({
       status: "EN_ROUTE",
-      destination: newDestId,
+      destination: { name: destName, lat: dest.lat, lng: dest.lng },
+      destination_name: destName,
       encoded_polyline: route.polyline.encodedPolyline,
-      current_step: 0, // Force simulator reset
+      current_step: 0,
       eta: route.duration,
       last_reason: reason,
-      simulator_active: null
+      waypoints: [
+        trip.current_location,
+        { lat: dest.lat, lng: dest.lng }
+      ]
     });
+    console.log(`[executeReroute] Trip ${tripId} rerouted to ${destName} (${dest.lat}, ${dest.lng})`);
   } catch (e) {
     console.error('[executeReroute] Failed:', e.message);
   }

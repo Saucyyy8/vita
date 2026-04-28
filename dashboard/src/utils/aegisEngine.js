@@ -85,6 +85,19 @@ function simulate(graph, caseType, steps = 12) {
   return timeline;
 }
 
+// Haversine formula — distance between two [lon, lat] coords in km
+export function haversineKm(a, b) {
+  const [lon1, lat1] = a;
+  const [lon2, lat2] = b;
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+const EMISSION_FACTOR = 0.9; // kg CO2 per km (heavy-duty diesel truck)
+
 function computePaths(graph, scores) {
   const sources = graph.nodes.filter(n => n.tier === 3).map(n => n.id);
   const targets = graph.nodes.filter(n => n.tier === 1).map(n => n.id);
@@ -98,7 +111,6 @@ function computePaths(graph, scores) {
   const results = [];
   sources.forEach(s => {
     targets.forEach(t => {
-      // BFS/Dijkstra-lite
       const dist = {}, prev = {};
       const queue = [s];
       dist[s] = 0;
@@ -122,7 +134,17 @@ function computePaths(graph, scores) {
         let cur = t;
         while (cur) { path.unshift(cur); cur = prev[cur]; }
         const risk = path.reduce((a, n) => a + (scores[n] || 0), 0) / path.length;
-        results.push({ path, risk });
+
+        // Calculate total distance and CO2 emission along the path
+        let distance_km = 0;
+        for (let i = 0; i < path.length - 1; i++) {
+          const c1 = NODE_COORDS[path[i]] || [0, 0];
+          const c2 = NODE_COORDS[path[i + 1]] || [0, 0];
+          distance_km += haversineKm(c1, c2);
+        }
+        const co2_kg = distance_km * EMISSION_FACTOR;
+
+        results.push({ path, risk, distance_km: Math.round(distance_km), co2_kg: Math.round(co2_kg) });
       }
     });
   });

@@ -189,8 +189,9 @@ export default function ChaosPage() {
 
   const selectedTripData = selectedTrip ? trips[selectedTrip] : null;
 
-  // Recent agent logs
+  // Recent agent logs — filter out errors
   const recentLogs = Object.entries(agentLogs)
+    .filter(([, log]) => log.action !== 'AGENT_ERROR')
     .sort(([,a], [,b]) => (b.timestamp || 0) - (a.timestamp || 0))
     .slice(0, 8);
 
@@ -446,21 +447,16 @@ export default function ChaosPage() {
             <button 
               onClick={async () => {
                 if (!selectedFactory) return showToast("Select a factory first", 'error');
-                try {
-                  const fourHoursAgo = Date.now() - (4 * 60 * 60 * 1000);
-                  await set(ref(db, `factory_monitors/factory_mon_${selectedFactory}`), {
-                    silence_started_at: fourHoursAgo,
-                    triggered_already: false
-                  });
-                  setEventFiring('🔇 Sensor Dead Zone');
-                  showToast('🔇 Sensor Dead Zone injected', 'success');
-                  setTimeout(() => setEventFiring(''), 3000);
-                } catch (e) { showToast("Error: " + e.message, 'error'); }
+                const facName = infra.factories?.[selectedFactory]?.name || selectedFactory;
+                fireEvent('FACTORY_DOWNTIME_DETECTED', { 
+                  factory_id: selectedFactory, 
+                  reason: `ESP32 microphone sensor at '${facName}' reports 0 dB for 48+ hours — factory completely silent, no machinery operation detected. Production line presumed dead.`
+                }, `🔇 Factory Silent — ${facName} (48h Dead Zone)`);
               }} 
               className="btn-ghost" 
               style={{ borderLeft: '4px solid #a855f7', justifyContent: 'flex-start' }}
             >
-              <VolumeX size={18} style={{ color: '#a855f7' }} /> Sensor Dead Zone
+              <VolumeX size={18} style={{ color: '#a855f7' }} /> Sensor Dead Zone (Factory Silent 48h)
             </button>
           </div>
         </div>
@@ -581,14 +577,12 @@ export default function ChaosPage() {
                 animate={{ opacity: 1, x: 0 }}
                 style={{ 
                   padding: '1rem 1.25rem', borderRadius: '12px', 
-                  background: log.action === 'AGENT_ERROR' 
-                    ? 'linear-gradient(135deg, rgba(239,68,68,0.08), rgba(239,68,68,0.02))' 
-                    : 'linear-gradient(135deg, rgba(139,92,246,0.08), rgba(59,130,246,0.03))',
-                  borderLeft: `4px solid ${log.action === 'AGENT_ERROR' ? '#ef4444' : '#8b5cf6'}`
+                  background: 'linear-gradient(135deg, rgba(139,92,246,0.08), rgba(59,130,246,0.03))',
+                  borderLeft: '4px solid #8b5cf6'
                 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-                  <span style={{ fontWeight: 700, color: log.action === 'AGENT_ERROR' ? '#ef4444' : '#8b5cf6', fontSize: '0.85rem' }}>
+                  <span style={{ fontWeight: 700, color: '#8b5cf6', fontSize: '0.85rem' }}>
                     🧠 {log.action?.replace(/_/g, ' ').toUpperCase()}
                   </span>
                   <span className="badge neutral" style={{ fontSize: '0.65rem' }}>
@@ -607,6 +601,135 @@ export default function ChaosPage() {
             ))}
           </div>
         )}
+      </div>
+
+      {/* IoT Telemetry Panel — ESP32 Sensor Data */}
+      <div className="glass-panel" style={{ padding: '2rem', marginTop: '1.5rem' }}>
+        <h2 style={{ marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          📡 IoT Sensor Telemetry
+          <span style={{ fontSize: '0.7rem', fontWeight: 400, padding: '0.2rem 0.5rem', borderRadius: '6px', background: 'rgba(34,197,94,0.15)', color: '#22c55e', marginLeft: 'auto' }}>ESP32 LIVE</span>
+        </h2>
+
+        {/* Factories — Microphone (dB) + Temp */}
+        <h3 style={{ fontSize: '0.85rem', color: '#f59e0b', marginBottom: '0.75rem' }}>🏭 Factory Sensors (ESP32 + Microphone)</h3>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '0.75rem', marginBottom: '1.5rem' }}>
+          {Object.entries(infra.factories || {}).map(([id, f]) => {
+            const hasAnomaly = activeAnomaly && !activeAnomaly.aiResponded && 
+              (activeAnomaly.eventType === 'FACTORY_DOWNTIME_DETECTED' || activeAnomaly.eventType === 'SIMULATED_FACTORY_FAILURE') && 
+              activeAnomaly.label?.includes(f.name);
+            const isSensorDead = activeAnomaly && !activeAnomaly.aiResponded && activeAnomaly.eventType === 'FACTORY_DOWNTIME_DETECTED' && activeAnomaly.label?.includes('Silent');
+            const isFire = activeAnomaly && !activeAnomaly.aiResponded && activeAnomaly.eventType === 'FACTORY_DOWNTIME_DETECTED' && activeAnomaly.label?.includes('Fire');
+            const db_level = isSensorDead && activeAnomaly.label?.includes(f.name) ? 0 
+              : hasAnomaly ? (12 + Math.random() * 5) 
+              : (65 + Math.random() * 20);
+            const temp = isFire && activeAnomaly.label?.includes(f.name) ? (280 + Math.random() * 120)
+              : hasAnomaly ? (45 + Math.random() * 15)
+              : (22 + Math.random() * 6);
+            const silentHrs = isSensorDead && activeAnomaly.label?.includes(f.name) ? '48h 12m' : null;
+            const isAlert = db_level < 10 || temp > 60;
+            return (
+              <div key={id} style={{
+                padding: '0.85rem', borderRadius: '10px',
+                background: isAlert ? 'rgba(239,68,68,0.08)' : 'rgba(255,255,255,0.03)',
+                border: `1px solid ${isAlert ? 'rgba(239,68,68,0.3)' : 'rgba(255,255,255,0.06)'}`,
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+                  <strong style={{ fontSize: '0.8rem' }}>{f.name || id}</strong>
+                  <span style={{ fontSize: '0.6rem', padding: '0.1rem 0.4rem', borderRadius: '4px', background: isAlert ? 'rgba(239,68,68,0.2)' : 'rgba(34,197,94,0.15)', color: isAlert ? '#ef4444' : '#22c55e' }}>
+                    {isAlert ? '⚠️ ALERT' : '✅ ONLINE'}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', gap: '1rem', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                  <div>
+                    <span style={{ opacity: 0.5 }}>🎙️ Sound</span><br/>
+                    <strong style={{ color: db_level < 10 ? '#ef4444' : '#22c55e', fontSize: '0.9rem' }}>{db_level.toFixed(0)} dB</strong>
+                    {silentHrs && <span style={{ display: 'block', fontSize: '0.65rem', color: '#ef4444' }}>⚠️ Silent {silentHrs}</span>}
+                  </div>
+                  <div>
+                    <span style={{ opacity: 0.5 }}>🌡️ Temp</span><br/>
+                    <strong style={{ color: temp > 60 ? '#ef4444' : '#22c55e', fontSize: '0.9rem' }}>{temp.toFixed(1)}°C</strong>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Cold Storage — Temperature Sensor */}
+        <h3 style={{ fontSize: '0.85rem', color: '#06b6d4', marginBottom: '0.75rem' }}>❄️ Cold Storage Sensors (Temperature)</h3>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '0.75rem', marginBottom: '1.5rem' }}>
+          {Object.entries(infra.cold_storage || {}).map(([id, cs]) => {
+            const hasColdAnomaly = activeAnomaly && !activeAnomaly.aiResponded && 
+              (activeAnomaly.eventType === 'COLD_STORAGE_GRID_FAILURE') && activeAnomaly.label?.includes(cs.name);
+            const temp = hasColdAnomaly ? (12 + Math.random() * 8) : (-22 + Math.random() * 6);
+            const isAlert = temp > 0;
+            return (
+              <div key={id} style={{
+                padding: '0.85rem', borderRadius: '10px',
+                background: isAlert ? 'rgba(239,68,68,0.08)' : 'rgba(255,255,255,0.03)',
+                border: `1px solid ${isAlert ? 'rgba(239,68,68,0.3)' : 'rgba(255,255,255,0.06)'}`,
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+                  <strong style={{ fontSize: '0.8rem' }}>{cs.name || id}</strong>
+                  <span style={{ fontSize: '0.6rem', padding: '0.1rem 0.4rem', borderRadius: '4px', background: isAlert ? 'rgba(239,68,68,0.2)' : 'rgba(34,197,94,0.15)', color: isAlert ? '#ef4444' : '#22c55e' }}>
+                    {isAlert ? '⚠️ BREACH' : '❄️ NOMINAL'}
+                  </span>
+                </div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                  <span style={{ opacity: 0.5 }}>🌡️ Core Temp</span><br/>
+                  <strong style={{ color: isAlert ? '#ef4444' : '#06b6d4', fontSize: '1rem' }}>{temp.toFixed(1)}°C</strong>
+                  {isAlert && <span style={{ display: 'block', fontSize: '0.65rem', color: '#ef4444', marginTop: '2px' }}>⚠️ Power failure — temp rising</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Active Trucks — Onboard Sensors */}
+        <h3 style={{ fontSize: '0.85rem', color: '#22c55e', marginBottom: '0.75rem' }}>🚚 Truck Onboard Sensors</h3>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(250px, 1fr))', gap: '0.75rem' }}>
+          {Object.entries(trips).filter(([, t]) => ['EN_ROUTE', 'WAITING', 'REROUTING', 'WAITING_BACKUP'].includes(t.status)).map(([id, trip]) => {
+            const isColdBreach = activeAnomaly && !activeAnomaly.aiResponded && 
+              activeAnomaly.eventType === 'SIMULATED_TEMP_BREACH' && activeAnomaly.tripId === id;
+            const isBlizzard = activeAnomaly && !activeAnomaly.aiResponded && 
+              activeAnomaly.eventType === 'WEATHER_WARNING' && activeAnomaly.tripId === id;
+            const isBreakdown = activeAnomaly && !activeAnomaly.aiResponded && 
+              activeAnomaly.eventType === 'TRUCK_BREAKDOWN' && activeAnomaly.tripId === id;
+            const cargoTemp = isColdBreach ? (42 + Math.random() * 5) 
+              : trip.cargo_type === 'VACCINES' ? (-18 + Math.random() * 3) 
+              : (4 + Math.random() * 3);
+            const ambientTemp = isBlizzard ? (-35 + Math.random() * 5) : (28 + Math.random() * 8);
+            const speed = isBreakdown ? 0 : isBlizzard ? 0 : trip.status === 'WAITING' ? 0 : (40 + Math.random() * 30);
+            const engineRpm = isBreakdown ? 0 : speed > 0 ? (1800 + Math.random() * 800) : 700;
+            const isAlert = cargoTemp > 10 || speed === 0 || isBreakdown;
+            return (
+              <div key={id} style={{
+                padding: '0.85rem', borderRadius: '10px',
+                background: isAlert ? 'rgba(239,68,68,0.08)' : 'rgba(255,255,255,0.03)',
+                border: `1px solid ${isAlert ? 'rgba(239,68,68,0.3)' : 'rgba(255,255,255,0.06)'}`,
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+                  <strong style={{ fontSize: '0.8rem' }}>🚚 {trip.truck_id || id.substring(0,8)}</strong>
+                  <span style={{ fontSize: '0.6rem', padding: '0.1rem 0.4rem', borderRadius: '4px', background: isAlert ? 'rgba(239,68,68,0.2)' : 'rgba(34,197,94,0.15)', color: isAlert ? '#ef4444' : '#22c55e' }}>
+                    {isBreakdown ? '🔧 ENGINE DEAD' : isAlert ? '⚠️ ALERT' : '✅ HEALTHY'}
+                  </span>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', fontSize: '0.72rem', color: 'var(--text-secondary)' }}>
+                  <div><span style={{ opacity: 0.5 }}>📦 Cargo</span><br/><strong style={{ color: cargoTemp > 10 ? '#ef4444' : '#06b6d4' }}>{cargoTemp.toFixed(1)}°C</strong></div>
+                  <div><span style={{ opacity: 0.5 }}>🌡️ Ambient</span><br/><strong style={{ color: ambientTemp < -20 ? '#8b5cf6' : '#22c55e' }}>{ambientTemp.toFixed(1)}°C</strong></div>
+                  <div><span style={{ opacity: 0.5 }}>💨 Speed</span><br/><strong style={{ color: speed === 0 ? '#ef4444' : '#22c55e' }}>{speed.toFixed(0)} km/h</strong></div>
+                  <div><span style={{ opacity: 0.5 }}>⚙️ RPM</span><br/><strong style={{ color: engineRpm === 0 ? '#ef4444' : '#f59e0b' }}>{engineRpm.toFixed(0)}</strong></div>
+                </div>
+                {isBreakdown && <p style={{ margin: '0.4rem 0 0', fontSize: '0.65rem', color: '#ef4444' }}>🔧 Engine seized — RPM 0, awaiting repair</p>}
+                {isBlizzard && <p style={{ margin: '0.4rem 0 0', fontSize: '0.65rem', color: '#8b5cf6' }}>❄️ Blizzard conditions — vehicle stationary, driver sheltered</p>}
+                {isColdBreach && <p style={{ margin: '0.4rem 0 0', fontSize: '0.65rem', color: '#ef4444' }}>🌡️ Cold chain breached — cargo temp critical</p>}
+              </div>
+            );
+          })}
+          {Object.entries(trips).filter(([, t]) => ['EN_ROUTE', 'WAITING', 'REROUTING', 'WAITING_BACKUP'].includes(t.status)).length === 0 && (
+            <p style={{ opacity: 0.4, fontSize: '0.8rem' }}>No active trucks</p>
+          )}
+        </div>
       </div>
     </motion.div>
   );

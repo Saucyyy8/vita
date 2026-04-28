@@ -3,7 +3,7 @@ import { httpsCallable } from 'firebase/functions';
 import { ref, onValue } from 'firebase/database';
 import { db, functions } from '../api/firebaseConfig';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Plus, Trash2, MapPin, RefreshCw, Truck, Brain } from 'lucide-react';
+import { Plus, Trash2, MapPin, RefreshCw, Truck, Brain, Play, Zap } from 'lucide-react';
 import { useJsApiLoader, Autocomplete } from '@react-google-maps/api';
 
 const libraries = ['places', 'geometry'];
@@ -33,6 +33,7 @@ export default function InfraPage() {
   const [deleteLoading, setDeleteLoading] = useState(null);
   const [successMsg, setSuccessMsg] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [quickSimLoading, setQuickSimLoading] = useState(false);
 
   // Form states
   const [type, setType] = useState('factories');
@@ -135,10 +136,42 @@ export default function InfraPage() {
     }
   };
 
-  // Active trips with useful info
-  const allTrips = Object.entries(trips);
-  const activeTrips = allTrips.filter(([_, t]) => !['KILLED', 'COMPLETED', 'ABORTED'].includes(t.status));
-  const completedTrips = allTrips.filter(([_, t]) => ['COMPLETED'].includes(t.status));
+  // Active trips with useful info — limit to 10
+  const allTrips = Object.entries(trips)
+    .sort(([,a], [,b]) => {
+      const order = { 'EN_ROUTE': 0, 'WAITING': 1, 'REROUTING': 2, 'PENDING_DRIVER_START': 3, 'COMPLETED': 5, 'KILLED': 6, 'ABORTED': 7 };
+      return (order[a.status] ?? 99) - (order[b.status] ?? 99);
+    })
+    .slice(0, 10);
+  const activeTrips = Object.entries(trips).filter(([_, t]) => !['KILLED', 'COMPLETED', 'ABORTED'].includes(t.status));
+  const completedTrips = Object.entries(trips).filter(([_, t]) => ['COMPLETED'].includes(t.status));
+
+  // Quick simulate trip handler
+  const handleQuickSim = async (originId, originData, destId, destData, originType) => {
+    setQuickSimLoading(true);
+    try {
+      const { push, set, ref: dbRef } = await import('firebase/database');
+      const newTripRef = push(dbRef(db, 'trips'));
+      await set(newTripRef, {
+        truck_id: `sim_${Date.now().toString(36)}`,
+        cargo_type: destData.name?.toLowerCase().includes('cold') ? 'VACCINES' : 'NORMAL_PACKAGE',
+        status: 'PENDING_DRIVER_START',
+        origin: { name: originData.name, lat: originData.lat, lng: originData.lng },
+        destination: { name: destData.name, lat: destData.lat, lng: destData.lng },
+        waypoints: [
+          { lat: originData.lat, lng: originData.lng },
+          { lat: destData.lat, lng: destData.lng }
+        ],
+        created_at: Date.now()
+      });
+      setSuccessMsg(`✅ Quick trip created: ${originData.name} → ${destData.name}`);
+      setTimeout(() => setSuccessMsg(''), 4000);
+    } catch (err) {
+      setErrorMsg('Failed: ' + err.message);
+    } finally {
+      setQuickSimLoading(false);
+    }
+  };
 
   const renderTable = (data, typeKey, typeLabel) => (
     <div style={{ overflowX: 'auto' }}>
@@ -311,13 +344,14 @@ export default function InfraPage() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
               <h2 style={{ margin: 0 }}>
                 <Truck size={22} style={{ verticalAlign: 'middle', marginRight: '0.5rem' }} />
-                Fleet Overview ({allTrips.length} trips)
+                Fleet Overview (Last 10)
               </h2>
               <div style={{ display: 'flex', gap: '1rem', fontSize: '0.72rem' }}>
                 <span style={{ color: '#22c55e' }}>● {activeTrips.length} Active</span>
                 <span style={{ color: '#10b981' }}>● {completedTrips.length} Completed</span>
               </div>
             </div>
+
 
             {allTrips.length === 0 ? (
               <p style={{ opacity: 0.4, textAlign: 'center', padding: '2rem' }}>No trips yet. Create one from the Create Trip page.</p>

@@ -2,7 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { httpsCallable } from 'firebase/functions';
 import { functions } from '../api/firebaseConfig';
 import { motion } from 'framer-motion';
-import { Route, Plus, Trash2, ArrowUp, ArrowDown, Truck } from 'lucide-react';
+import { Route, Plus, Trash2, ArrowUp, ArrowDown, Truck, Zap } from 'lucide-react';
+import { db } from '../api/firebaseConfig';
+import { ref, push, set } from 'firebase/database';
 import { useJsApiLoader, Autocomplete } from '@react-google-maps/api';
 
 const libraries = ['places', 'geometry'];
@@ -16,6 +18,7 @@ export default function CreateTripPage() {
   const [infra, setInfra] = useState({ factories: {}, cold_storage: {} });
   const [loading, setLoading] = useState(false);
   const [messages, setMessages] = useState([]);
+  const [quickTestLoading, setQuickTestLoading] = useState(false);
 
   // Fetch Factories & Cold Storage via Cloud Function (bypasses DB rules)
   useEffect(() => {
@@ -188,6 +191,71 @@ export default function CreateTripPage() {
         <h1>Deploy Fleet Operations</h1>
         <button onClick={addFleet} className="btn-secondary">
           <Truck size={18} /> Add Another Truck
+        </button>
+      </div>
+
+      {/* Quick Test Trip — Pre-built multi-stop */}
+      <div className="glass-panel" style={{ padding: '1.5rem', marginBottom: '2rem', borderLeft: '4px solid #22c55e', background: 'linear-gradient(135deg, rgba(34,197,94,0.06), rgba(34,197,94,0.01))' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+          <div>
+            <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <Zap size={20} style={{ color: '#22c55e' }} /> Quick Test Trip
+            </h2>
+            <p style={{ margin: '0.3rem 0 0', fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+              One-click multi-stop simulation covering all infrastructure nodes
+            </p>
+          </div>
+        </div>
+        <div style={{ padding: '0.75rem', borderRadius: '10px', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)', marginBottom: '1rem' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center', fontSize: '0.8rem' }}>
+            {activeFacs.map(([id, f], i) => (
+              <React.Fragment key={id}>
+                <span style={{ padding: '0.3rem 0.6rem', borderRadius: '6px', background: 'rgba(245,158,11,0.12)', color: '#f59e0b', fontWeight: 600, fontSize: '0.75rem' }}>
+                  🏭 {f.name}
+                </span>
+                <span style={{ opacity: 0.3 }}>→</span>
+              </React.Fragment>
+            ))}
+            {activeCS.map(([id, cs], i) => (
+              <React.Fragment key={id}>
+                <span style={{ padding: '0.3rem 0.6rem', borderRadius: '6px', background: 'rgba(6,182,212,0.12)', color: '#06b6d4', fontWeight: 600, fontSize: '0.75rem' }}>
+                  ❄️ {cs.name}
+                </span>
+                {i < activeCS.length - 1 && <span style={{ opacity: 0.3 }}>→</span>}
+              </React.Fragment>
+            ))}
+          </div>
+          <p style={{ margin: '0.5rem 0 0', fontSize: '0.7rem', opacity: 0.4 }}>Truck: auto-assigned | Cargo: VACCINES | Covers all waypoints</p>
+        </div>
+        <button
+          onClick={async () => {
+            setQuickTestLoading(true);
+            try {
+              const allNodes = [...activeFacs.map(([id, f]) => ({ lat: f.lat, lng: f.lng, name: f.name })), ...activeCS.map(([id, cs]) => ({ lat: cs.lat, lng: cs.lng, name: cs.name }))];
+              if (allNodes.length < 2) { setMessages([{ type: 'error', text: 'Need at least 2 infrastructure nodes' }]); return; }
+              const waypoints = allNodes.map(n => ({ lat: n.lat, lng: n.lng }));
+              const newTripRef = push(ref(db, 'trips'));
+              await set(newTripRef, {
+                truck_id: `test_${Date.now().toString(36)}`,
+                cargo_type: 'VACCINES',
+                status: 'PENDING_DRIVER_START',
+                origin: { name: allNodes[0].name, lat: allNodes[0].lat, lng: allNodes[0].lng },
+                destination: { name: allNodes[allNodes.length - 1].name, lat: allNodes[allNodes.length - 1].lat, lng: allNodes[allNodes.length - 1].lng },
+                waypoints,
+                created_at: Date.now()
+              });
+              setMessages([{ type: 'success', text: `✅ Quick test trip created: ${allNodes.map(n => n.name).join(' → ')}` }]);
+            } catch (err) {
+              setMessages([{ type: 'error', text: 'Failed: ' + err.message }]);
+            } finally {
+              setQuickTestLoading(false);
+            }
+          }}
+          disabled={quickTestLoading || activeFacs.length === 0}
+          className="btn-primary"
+          style={{ padding: '0.75rem 2rem', fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}
+        >
+          <Zap size={16} /> {quickTestLoading ? 'Creating...' : 'Deploy Quick Test Trip'}
         </button>
       </div>
       
