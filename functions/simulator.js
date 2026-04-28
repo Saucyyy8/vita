@@ -22,7 +22,9 @@
  *   3. Every 2 seconds, advances the truck to the next coordinate
  *   4. Updates /trips/{id}/current_location AND /devices/{truck_id}/current
  *   5. When it reaches the end, sets status to "COMPLETED"
- *   6. If the trip status changes (KILLED, WAITING, etc.), it stops
+ *   6. If the trip status changes (KILLED, etc.), it stops
+ *   7. If the route is recalculated (new polyline), it reloads the path
+ *      and continues from the beginning of the new route
  * 
  * FROM THE DASHBOARD:
  *   - Create a trip on the "Create Trip" page
@@ -64,6 +66,20 @@ const STEP_INTERVAL_MS = 2000;
 
 // Skip N points to speed up simulation (1 = use every point, 3 = use every 3rd point)
 const SKIP_FACTOR = 3;
+
+/**
+ * Decode a polyline string into a filtered array of [lat, lng] pairs
+ */
+function decodeAndFilterPath(encodedPolyline) {
+  const decoded = polyline.decode(encodedPolyline);
+  const filtered = decoded.filter((_, i) => i % SKIP_FACTOR === 0);
+  // Always include the last point (destination)
+  const lastPoint = decoded[decoded.length - 1];
+  if (filtered.length === 0 || filtered[filtered.length - 1] !== lastPoint) {
+    filtered.push(lastPoint);
+  }
+  return { decoded, filtered };
+}
 
 async function startSimulation() {
   console.log("\n╔══════════════════════════════════════════════╗");
@@ -113,55 +129,93 @@ function simulateTrip(tripId, trip) {
   // Mark as actively simulating
   db.ref(`/trips/${tripId}/simulator_active`).set(true);
 
-  // Decode polyline
-  let decodedPath = [];
+  // Decode polyline — these are MUTABLE so they can be swapped when route changes
+  let currentPolyline = trip.encoded_polyline;
+  let pathData;
   try {
-    decodedPath = polyline.decode(trip.encoded_polyline);
+    pathData = decodeAndFilterPath(currentPolyline);
   } catch (e) {
     console.error(`   ❌ Failed to decode polyline: ${e.message}`);
     activeSimulations.delete(tripId);
     return;
   }
 
-  // Apply skip factor for faster simulation
-  const path = decodedPath.filter((_, i) => i % SKIP_FACTOR === 0);
-  // Always include the last point (destination)
-  const lastPoint = decodedPath[decodedPath.length - 1];
-  if (path[path.length - 1] !== lastPoint) path.push(lastPoint);
-
-  console.log(`   📍 Route: ${decodedPath.length} raw points → ${path.length} simulation steps`);
-  console.log(`   ⏱️  ETA: ~${Math.ceil(path.length * STEP_INTERVAL_MS / 1000)}s at ${STEP_INTERVAL_MS}ms/step\n`);
-  
+  let simulationPath = pathData.filtered;
   let currentIndex = 0;
+
+  console.log(`   📍 Route: ${pathData.decoded.length} raw points → ${simulationPath.length} simulation steps`);
+  console.log(`   ⏱️  ETA: ~${Math.ceil(simulationPath.length * STEP_INTERVAL_MS / 1000)}s at ${STEP_INTERVAL_MS}ms/step\n`);
+
+  function stopSimulation(reason) {
+    clearInterval(interval);
+    activeSimulations.delete(tripId);
+    db.ref(`/trips/${tripId}/simulator_active`).remove();
+    if (reason) console.log(reason);
+  }
   
   const interval = setInterval(async () => {
     try {
-      // Check if trip status changed (killed, waiting, etc.)
-      const statusSnap = await db.ref(`/trips/${tripId}/status`).once('value');
-      const currentStatus = statusSnap.val();
+      // Read FULL trip state each tick (not just status)
+      // This lets us detect polyline changes from route recalculation
+      const tripSnap = await db.ref(`/trips/${tripId}`).once('value');
+      const currentTrip = tripSnap.val();
       
-      if (currentStatus !== 'EN_ROUTE' && currentStatus !== 'REROUTING') {
-        console.log(`\n⏸️  Trip ${tripId} status changed to "${currentStatus}". Stopping simulation.`);
-        clearInterval(interval);
-        activeSimulations.delete(tripId);
-        await db.ref(`/trips/${tripId}/simulator_active`).remove();
+      if (!currentTrip) {
+        stopSimulation(`\n❌ Trip ${tripId} was deleted. Stopping simulation.`);
         return;
       }
 
-      // Check if we reached the destination
-      if (currentIndex >= path.length) {
-        clearInterval(interval);
-        activeSimulations.delete(tripId);
+      const currentStatus = currentTrip.status;
+
+      // === TERMINAL STATES: stop permanently ===
+      if (['KILLED', 'COMPLETED', 'ABORTED'].includes(currentStatus)) {
+        stopSimulation(`\n🛑 Trip ${tripId} is ${currentStatus}. Stopping simulation permanently.`);
+        return;
+      }
+      
+      // === WAITING / NON-MOVING STATES: pause but keep interval alive ===
+      // This is critical — the agent may set WAITING briefly while computing a new route,
+      // then immediately set EN_ROUTE with a new polyline. If we kill the interval here,
+      // we miss the transition and the truck never resumes on the new route.
+      if (currentStatus !== 'EN_ROUTE' && currentStatus !== 'REROUTING') {
+        process.stdout.write(`\r   ⏸️  [PAUSED] Trip ${tripId} is ${currentStatus} — waiting for AI/route update...          `);
+        return; // Skip this tick, but keep interval running
+      }
+
+      // === CHECK FOR ROUTE RECALCULATION ===
+      // If the encoded_polyline changed (cloud function recalculated), reload the path
+      if (currentTrip.encoded_polyline && currentTrip.encoded_polyline !== currentPolyline) {
+        console.log(`\n\n🔄 Trip ${tripId}: ROUTE RECALCULATED by AI Agent!`);
+        console.log(`   Loading new path...`);
+        
+        currentPolyline = currentTrip.encoded_polyline;
+        try {
+          pathData = decodeAndFilterPath(currentPolyline);
+          simulationPath = pathData.filtered;
+          currentIndex = 0;
+          console.log(`   📍 New route: ${pathData.decoded.length} raw → ${simulationPath.length} simulation steps`);
+          console.log(`   ⏱️  New ETA: ~${Math.ceil(simulationPath.length * STEP_INTERVAL_MS / 1000)}s\n`);
+        } catch (e) {
+          console.error(`   ❌ Failed to decode new polyline: ${e.message}`);
+          stopSimulation(`   Stopping simulation due to decode error.`);
+          return;
+        }
+      }
+
+      // === CHECK DESTINATION ===
+      if (currentIndex >= simulationPath.length) {
         console.log(`\n🎉 Trip ${tripId} COMPLETED! Truck ${trip.truck_id} arrived at destination.`);
         await db.ref(`/trips/${tripId}`).update({ 
           status: 'COMPLETED', 
           simulator_active: null,
           completed_at: admin.database.ServerValue.TIMESTAMP
         });
+        stopSimulation(null);
         return;
       }
       
-      const [lat, lng] = path[currentIndex];
+      // === ADVANCE THE TRUCK ===
+      const [lat, lng] = simulationPath[currentIndex];
       
       // Update trip location
       await db.ref(`/trips/${tripId}/current_location`).set({ lat, lng });
@@ -175,9 +229,9 @@ function simulateTrip(tripId, trip) {
       }
       
       // Progress bar
-      const progress = Math.floor((currentIndex / path.length) * 100);
+      const progress = Math.floor((currentIndex / simulationPath.length) * 100);
       const bar = '█'.repeat(Math.floor(progress / 5)) + '░'.repeat(20 - Math.floor(progress / 5));
-      process.stdout.write(`\r   [${bar}] ${progress}% | Step ${currentIndex + 1}/${path.length} | [${lat.toFixed(4)}, ${lng.toFixed(4)}]`);
+      process.stdout.write(`\r   [${bar}] ${progress}% | Step ${currentIndex + 1}/${simulationPath.length} | [${lat.toFixed(4)}, ${lng.toFixed(4)}]`);
       
       currentIndex++;
     } catch (err) {

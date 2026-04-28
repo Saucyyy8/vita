@@ -78,6 +78,45 @@ exports.getInfrastructure = onCall({ cors: true }, async (request) => {
   }
 });
 
+/** ==========================================
+ *  1.5.1 AEGIS SUPPLY CHAIN SIMULATION — ROUTE EXPLANATION
+ *  ========================================== */
+exports.explainRoute = onCall({ cors: true }, async (request) => {
+  const { path: routePath, risk, caseType } = request.data;
+  if (!routePath || routePath.length === 0) {
+    throw new HttpsError('invalid-argument', 'path is required.');
+  }
+
+  const prompt = `You are an expert in supply chain risk analysis for the ${caseType || 'global'} sector.
+
+Compare this route with alternatives and explain WHY it is the optimal choice.
+
+Path: ${routePath.join(' → ')}
+Risk Score: ${(risk || 0).toFixed(2)}
+
+Requirements:
+- Mention specific nodes (factories, hubs, suppliers) by name
+- Identify which node reduces or increases risk
+- Explain why alternative paths would be worse
+- Be concrete and data-driven, no vague statements
+- Maximum 4 sentences`;
+
+  try {
+    const generativeModel = vertexAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const result = await generativeModel.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }]
+    });
+    const text = result.response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return { path: routePath, risk, explanation: text.trim() };
+  } catch (err) {
+    // Fallback if Gemini fails
+    const fallback = `This route is selected due to lower cumulative disruption risk (${(risk || 0).toFixed(2)}). ` +
+      `Node "${routePath[Math.floor(routePath.length / 2)]}" acts as a stable intermediary, ` +
+      `reducing risk propagation compared to higher-risk alternatives.`;
+    return { path: routePath, risk, explanation: fallback };
+  }
+});
+
 exports.createInfrastructureNode = onCall({ cors: true }, async (request) => {
   const data = request.data;
   try {
@@ -103,6 +142,39 @@ exports.createInfrastructureNode = onCall({ cors: true }, async (request) => {
       }
     };
   } catch (err) {
+    throw new HttpsError('internal', err.message);
+  }
+});
+
+exports.deleteInfrastructureNode = onCall({ cors: true }, async (request) => {
+  const { type, id } = request.data;
+  if (!type || !id) throw new HttpsError('invalid-argument', 'type and id are required.');
+  if (!['factories', 'cold_storage'].includes(type)) {
+    throw new HttpsError('invalid-argument', 'type must be "factories" or "cold_storage".');
+  }
+
+  try {
+    const nodeRef = db.ref(`/infrastructure/${type}/${id}`);
+    const snap = await nodeRef.get();
+    if (!snap.exists()) throw new HttpsError('not-found', `${type} node ${id} does not exist.`);
+    
+    const nodeName = snap.val().name || id;
+    await nodeRef.remove();
+
+    // Return updated infrastructure
+    const infraSnap = await db.ref('/infrastructure').once('value');
+    const allInfra = infraSnap.val() || {};
+    console.log(`[deleteInfrastructureNode] Deleted ${type}/${id} (${nodeName})`);
+    return {
+      success: true,
+      deleted: { type, id, name: nodeName },
+      infrastructure: {
+        factories: allInfra.factories || {},
+        cold_storage: allInfra.cold_storage || {}
+      }
+    };
+  } catch (err) {
+    if (err.code && err.httpErrorCode) throw err;
     throw new HttpsError('internal', err.message);
   }
 });
@@ -178,6 +250,43 @@ exports.pauseTrip = onCall({ cors: true }, async (request) => {
 
     console.log(`[pauseTrip] Trip ${trip_id} halted: ${reason}`);
     return { success: true };
+  } catch (err) {
+    if (err.code && err.httpErrorCode) throw err;
+    throw new HttpsError('internal', err.message);
+  }
+});
+
+exports.resumeTrip = onCall({ cors: true }, async (request) => {
+  const { trip_id, reason } = request.data;
+  if (!trip_id) throw new HttpsError('invalid-argument', 'trip_id is required.');
+  
+  try {
+    const tripSnap = await db.ref(`/trips/${trip_id}`).get();
+    if (!tripSnap.exists()) throw new HttpsError('not-found', 'Trip does not exist.');
+    const trip = tripSnap.val();
+    
+    if (trip.status !== 'WAITING' && trip.status !== 'AWAITING_RESCUE_ACCEPTANCE') {
+      throw new HttpsError('failed-precondition', `Trip is not in a resumable state (current: ${trip.status}).`);
+    }
+    
+    await db.ref(`/trips/${trip_id}`).update({
+      status: 'EN_ROUTE',
+      wait_reason: null,
+      last_reason: reason || 'Manually resumed by operator',
+      simulator_active: null
+    });
+
+    // Log the manual resume as an agent decision for audit trail
+    await db.ref('/agent_log').push({
+      event_type: 'MANUAL_RESUME',
+      trip_id: trip_id,
+      action: 'resume_trip',
+      reason: reason || 'Manually resumed by operator — conditions cleared',
+      timestamp: admin.database.ServerValue.TIMESTAMP
+    });
+
+    console.log(`[resumeTrip] Trip ${trip_id} resumed: ${reason}`);
+    return { success: true, message: `Trip ${trip_id} has been resumed.` };
   } catch (err) {
     if (err.code && err.httpErrorCode) throw err;
     throw new HttpsError('internal', err.message);
@@ -281,70 +390,69 @@ const supplyChainTools = [{
   functionDeclarations: [
     {
       name: "reroute_to_alternate_pickup",
-      description: "Reroute a truck to an alternate active facility. Use when targeted pickup location (factory or cold storage) is down, on fire, or unavailable. Pick the geographically nearest active facility.",
+      description: "Reroute a truck to an alternate active facility (factory or cold storage). Use when: (a) the targeted destination is down/on fire/offline, OR (b) for TEMP_BREACH on temperature-sensitive cargo — reroute to the nearest ACTIVE cold_storage hub for emergency preservation. Pick the geographically nearest ACTIVE facility from INFRASTRUCTURE STATUS.",
       parameters: {
         type: "OBJECT",
         properties: {
           trip_id: { type: "STRING", description: "The trip ID to reroute" },
-          new_destination_id: { type: "STRING", description: "ID of an alternate ACTIVE facility from the INFRASTRUCTURE STATUS. NEVER guess or hallucinate this ID." },
-          reason: { type: "STRING", description: "Human-readable reason for rerouting. Describe the specific coordinates or area involved." }
+          new_destination_id: { type: "STRING", description: "ID of an alternate ACTIVE facility from the INFRASTRUCTURE STATUS. MUST be a real ID from the provided data. NEVER guess or hallucinate." },
+          reason: { type: "STRING", description: "Human-readable reason explaining what happened and why this specific facility was chosen. 2-3 sentences." }
         },
         required: ["trip_id", "new_destination_id", "reason"]
       }
     },
     {
       name: "recalculate_route_to_current_destination",
-      description: "Use this to recalculate a new route to the SAME destination, avoiding the roadblock or traffic anomaly. The truck will autonomously find a detour.",
+      description: "Recalculate an alternative route to the SAME destination, bypassing the roadblock or obstruction. The system will use Google Routes API with computeAlternativeRoutes to find a completely different path. Use this for ROAD_BLOCK / ROAD_COLLAPSE events.",
       parameters: {
         type: "OBJECT",
         properties: {
           trip_id: { type: "STRING" },
-          reason: { type: "STRING", description: "Why we are recalculating. DO NOT mention 'Highway 44' unless it's in the event data. Mention the specific area or incident." }
+          reason: { type: "STRING", description: "What obstruction is being bypassed and why an alternative route is being computed. Reference the event details." }
         },
         required: ["trip_id", "reason"]
       }
     },
     {
       name: "instruct_driver_shelter",
-      description: "Order the driver to STOP immediately and pull over to shelter. Use for severe weather (Thunderstorm, Tornado, Flood, Cyclone). The truck halts until conditions improve.",
+      description: "Order the driver to STOP immediately and take shelter. Use for severe/dangerous weather (Blizzard, Thunderstorm, Tornado, Flood, Cyclone, Arctic conditions). The truck halts until conditions improve. Do NOT verify weather — trust the event data.",
       parameters: {
         type: "OBJECT",
         properties: {
           trip_id: { type: "STRING" },
-          wait_time_minutes: { type: "INTEGER", description: "Estimated wait in minutes" },
-          reason: { type: "STRING", description: "Why the driver must stop (2-3 sentences)" }
+          wait_time_minutes: { type: "INTEGER", description: "Estimated wait in minutes based on severity" },
+          reason: { type: "STRING", description: "Why the driver must stop. Describe the danger. 2-3 sentences." }
         },
         required: ["trip_id", "wait_time_minutes", "reason"]
       }
     },
     {
       name: "return_to_origin_or_safe_harbor",
-      description: "ABORT the mission entirely. Send truck back to nearest safe location. Use when ALL factories are down, route is completely impassable, or cargo is compromised beyond recovery.",
+      description: "ABORT the mission entirely and send truck back to the origin or nearest safe location. Use when: (a) ALL factories/destinations are down with no alternatives, (b) route is completely impassable with no detour possible, (c) cargo is compromised beyond recovery and continuing is futile.",
       parameters: {
         type: "OBJECT",
         properties: {
           trip_id: { type: "STRING" },
-          reason: { type: "STRING", description: "Why the mission is aborted (2-3 sentences)" }
+          reason: { type: "STRING", description: "Why the mission is aborted and what the driver should do. 2-3 sentences." }
         },
         required: ["trip_id", "reason"]
       }
     },
     {
       name: "dispatch_backup_truck",
-      description: "Summon a replacement truck when the current truck has a mechanical failure or breakdown. The original truck halts and a backup is requested.",
+      description: "Summon a replacement truck when the current truck has a mechanical failure, engine seizure, or breakdown. The original truck is immobilized and the driver waits for cargo transfer to the backup.",
       parameters: {
         type: "OBJECT",
         properties: {
           original_trip_id: { type: "STRING" },
-          reason: { type: "STRING", description: "Details of the breakdown and backup plan (2-3 sentences)" }
+          reason: { type: "STRING", description: "Details of the breakdown, what failed, and the backup/rescue plan. 2-3 sentences." }
         },
         required: ["original_trip_id", "reason"]
       }
     },
-
     {
       name: "resume_trip",
-      description: "Resume a halted trip. Use when conditions have improved (weather cleared, backup arrived, etc.).",
+      description: "Resume a halted trip. Use when conditions have improved (weather cleared, backup arrived, obstruction removed, etc.).",
       parameters: {
         type: "OBJECT",
         properties: {
@@ -356,19 +464,19 @@ const supplyChainTools = [{
     },
     {
       name: "mark_cargo_compromised",
-      description: "Flag the cargo as compromised due to temperature breach, contamination, or damage. The trip continues but cargo is marked for inspection at destination.",
+      description: "Flag the cargo as compromised due to temperature breach, contamination, or damage. For temperature-sensitive cargo (VACCINES, FROZEN_FOOD, PRODUCE): if temp exceeded safe limits for extended period, cargo is unsafe. For NORMAL_PACKAGE cargo: temperature breaches are not critical.",
       parameters: {
         type: "OBJECT",
         properties: {
           trip_id: { type: "STRING" },
-          reason: { type: "STRING", description: "What happened to the cargo" }
+          reason: { type: "STRING", description: "What happened to the cargo and why it is compromised. Include temp data if available." }
         },
         required: ["trip_id", "reason"]
       }
     },
     {
       name: "no_action_needed",
-      description: "Use when the event does not require any intervention. Log the reasoning.",
+      description: "Use when the event does not require any intervention (e.g., temp breach on NORMAL_PACKAGE cargo). Log the reasoning.",
       parameters: {
         type: "OBJECT",
         properties: {
@@ -413,8 +521,20 @@ exports.masterAgent = onValueCreated("/events/{eventId}", async (event) => {
 
   console.log(`[Master Agent] Processing event ${eventId}: ${eventData.type}`);
 
+  // Cooldown: skip if another event of the same type was processed <10s ago
+  const cooldownKey = `${eventData.type}_${eventData.trip_id || eventData.factory_id || 'global'}`;
+  const cooldownSnap = await db.ref(`/agent_cooldowns/${cooldownKey}`).get();
+  if (cooldownSnap.exists()) {
+    const lastFired = cooldownSnap.val();
+    if (Date.now() - lastFired < 10000) {
+      console.log(`[Master Agent] Cooldown active for ${cooldownKey}. Skipping duplicate event.`);
+      return null;
+    }
+  }
+  await db.ref(`/agent_cooldowns/${cooldownKey}`).set(Date.now());
+
   try {
-    // 1. Gather ALL context
+    // 1. Gather context — only what we need
     const tripId = eventData.trip_id || null;
     const [tripSnap, allTripsSnap, facSnap, csSnap] = await Promise.all([
       tripId ? db.ref(`/trips/${tripId}`).get() : Promise.resolve(null),
@@ -441,17 +561,14 @@ exports.masterAgent = onValueCreated("/events/{eventId}", async (event) => {
     const allColdStorages = csSnap.val() || {};
     const allTrips = allTripsSnap.val() || {};
 
+    // Provide ALL active infrastructure — trimmed to essential fields only
     let factories = {};
     let coldStorages = {};
-
-    if (resolvedTrip && resolvedTrip.waypoints) {
-      const wpCoords = resolvedTrip.waypoints.map(w => `${parseFloat(w.lat).toFixed(4)},${parseFloat(w.lng).toFixed(4)}`);
-      for (const [id, f] of Object.entries(allFactories)) {
-        if (wpCoords.includes(`${parseFloat(f.lat).toFixed(4)},${parseFloat(f.lng).toFixed(4)}`)) factories[id] = f;
-      }
-      for (const [id, cs] of Object.entries(allColdStorages)) {
-        if (wpCoords.includes(`${parseFloat(cs.lat).toFixed(4)},${parseFloat(cs.lng).toFixed(4)}`)) coldStorages[id] = cs;
-      }
+    for (const [id, f] of Object.entries(allFactories)) {
+      if (f.status === 'ACTIVE') factories[id] = { name: f.name, lat: f.lat, lng: f.lng };
+    }
+    for (const [id, cs] of Object.entries(allColdStorages)) {
+      if (cs.status === 'ACTIVE') coldStorages[id] = { name: cs.name, lat: cs.lat, lng: cs.lng };
     }
 
     // 2. Check weather at truck's current location if available
@@ -463,46 +580,88 @@ exports.masterAgent = onValueCreated("/events/{eventId}", async (event) => {
 
     const eventLabel = eventData.label || eventData.metadata?.desc || eventData.type;
 
-    // 3. Build comprehensive prompt
-    const prompt = `
-You are VITA Master Agent — an autonomous AI logistics commander. You have FULL AUTHORITY to make real-time decisions.
+    // Trim trip data to essential fields to reduce token count
+    const trimmedTrip = resolvedTrip ? {
+      truck_id: resolvedTrip.truck_id,
+      status: resolvedTrip.status,
+      cargo_type: resolvedTrip.cargo_type,
+      cargo_compromised: resolvedTrip.cargo_compromised || false,
+      current_location: resolvedTrip.current_location,
+      waypoints: resolvedTrip.waypoints,
+      destination: resolvedTrip.destination
+    } : null;
 
-## INCOMING EVENT
-Type: ${eventData.type}
-Label: ${eventLabel}
-Full Event Data: ${JSON.stringify(eventData)}
+    // Trim fleet data — only active trips, essential fields
+    const trimmedFleet = Object.fromEntries(
+      Object.entries(allTrips)
+        .filter(([_, t]) => ['EN_ROUTE', 'PENDING_DRIVER_START', 'WAITING'].includes(t.status))
+        .map(([id, t]) => [id, { truck_id: t.truck_id, status: t.status, cargo_type: t.cargo_type, destination: t.destination, current_location: t.current_location }])
+    );
+
+    // 3. Build prompt — optimized for token efficiency
+    const prompt = `
+You are the VITA Autonomous Logistics Brain. Make ONE autonomous decision by calling exactly ONE tool function.
+
+## EVENT
+Type: ${eventData.type} | Label: ${eventLabel}
+Details: ${eventData.reason || eventData.description || eventData.metadata?.desc || 'N/A'}
+${eventData.value ? `Temp: ${eventData.value}°C (rule: ${eventData.rule}°C)` : ''}
+${eventData.factory_id ? `Factory: ${eventData.factory_id}` : ''}
+${eventData.cold_storage_id ? `Cold Storage: ${eventData.cold_storage_id} (${eventData.cold_storage_name || ''})` : ''}
 
 ## AFFECTED TRIP
-Trip ID: ${resolvedTripId || 'NONE'}
-Trip Data: ${JSON.stringify(resolvedTrip)}
+ID: ${resolvedTripId || 'NONE'}
+${trimmedTrip ? `Truck: ${trimmedTrip.truck_id} | Cargo: ${trimmedTrip.cargo_type} | Status: ${trimmedTrip.status}${trimmedTrip.cargo_compromised ? ' | ⚠️ CARGO ALREADY COMPROMISED' : ''}
+Location: ${JSON.stringify(trimmedTrip.current_location)}
+Waypoints: ${JSON.stringify(trimmedTrip.waypoints)}` : 'No trip data'}
 
-## LIVE WEATHER INTELLIGENCE
+## WEATHER
 ${weatherContext}
 
-## INFRASTRUCTURE STATUS
-Active Factories (${Object.keys(factories).length}): ${JSON.stringify(factories)}
-Active Cold Storages (${Object.keys(coldStorages).length}): ${JSON.stringify(coldStorages)}
+## INFRASTRUCTURE (ACTIVE)
+Factories: ${JSON.stringify(factories)}
+Cold Storages: ${JSON.stringify(coldStorages)}
 
-## ALL ACTIVE FLEET
-${JSON.stringify(Object.fromEntries(Object.entries(allTrips).filter(([_, t]) => ['EN_ROUTE', 'PENDING_DRIVER_START'].includes(t.status))))}
+## FLEET
+${JSON.stringify(trimmedFleet)}
 
-## DECISION PROTOCOL
-1. TRUCK_BREAKDOWN → IMMEDIATELY halt the truck. Call 'dispatch_backup_truck'. The driver waits for rescue.
-2. FACTORY_DOWNTIME_DETECTED / SIMULATED_FACTORY_FAILURE → Find ALL trips heading to the downed factory. Reroute each to the nearest ACTIVE alternate factory. If NO factories remain, abort.
-3. WEATHER_WARNING → Do NOT verify. The weather is already critically dangerous. Immediately call 'instruct_driver_shelter' to protect the driver.
-4. SIMULATED_TEMP_BREACH → Cargo may be compromised. Call 'mark_cargo_compromised' and decide if the trip should continue.
-5. SIMULATED_ROAD_BLOCK → Use 'recalculate_route_to_current_destination' to simply detour around the blockage to the same destination. ONLY use 'reroute_to_alternate_pickup' to abandon the destination if a much closer ACTIVE facility exists in the INFRASTRUCTURE STATUS. NEVER hallucinate facility IDs!
+## SOPs
+1. ROAD_BLOCK → 'recalculate_route_to_current_destination' (default detour). Abort if no alternatives. Hold if minor/temporary.
+2. TRUCK_BREAKDOWN → 'dispatch_backup_truck' immediately. No other option.
+3. TEMP_BREACH → For VACCINES/FROZEN_FOOD/PRODUCE: call 'reroute_to_alternate_pickup' to nearest cold_storage (emergency diversion, #1 priority). If none available, 'mark_cargo_compromised'. For NORMAL_PACKAGE: 'no_action_needed'.
+4. FACTORY_FAILURE → 'reroute_to_alternate_pickup' to nearest ACTIVE factory. If none, 'return_to_origin_or_safe_harbor'.
+5. COLD_STORAGE_FAILURE → Intercept trucks heading to affected hub, 'reroute_to_alternate_pickup' to another ACTIVE cold storage.
+6. WEATHER_WARNING → 'instruct_driver_shelter' immediately. Blizzard: 180min, storm: 90min.
 
-IMPORTANT: You MUST call exactly ONE tool function. Use the provided event label wording verbatim in your reasoning (no renaming). Provide detailed reasoning in the 'reason' field — this will be shown to the operations manager as an Explainable AI decision log.
+RULES: Call exactly ONE tool. Use real facility IDs from INFRASTRUCTURE only. Give detailed reasoning in 'reason'. NORMAL_PACKAGE has no temp constraints.
 `;
 
-    // 4. Call Gemini
-    const generativeModel = vertexAI.getGenerativeModel({ model: "gemini-2.5-pro" });
-    const result = await generativeModel.generateContent({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      tools: supplyChainTools,
-      tool_config: { function_calling_config: { mode: "ANY" } }
-    });
+    // 4. Call Gemini with retry for rate limiting
+    const generativeModel = vertexAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    
+    let result;
+    const MAX_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        result = await generativeModel.generateContent({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          tools: supplyChainTools,
+          tool_config: { function_calling_config: { mode: "ANY" } }
+        });
+        break; // Success — exit retry loop
+      } catch (apiErr) {
+        const isRateLimit = apiErr.message?.includes('429') || apiErr.message?.includes('RESOURCE_EXHAUSTED');
+        const isTransient = apiErr.message?.includes('503') || apiErr.message?.includes('UNAVAILABLE');
+        
+        if ((isRateLimit || isTransient) && attempt < MAX_RETRIES) {
+          const delay = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
+          console.log(`[Master Agent] Rate limited (attempt ${attempt}/${MAX_RETRIES}). Retrying in ${delay/1000}s...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          throw apiErr; // Non-retryable or max retries exceeded
+        }
+      }
+    }
 
     const candidate = result.response?.candidates?.[0];
     const functionCall = candidate?.content?.parts?.[0]?.functionCall;
@@ -526,9 +685,11 @@ IMPORTANT: You MUST call exactly ONE tool function. Use the provided event label
 
     if (actionName === "recalculate_route_to_current_destination") {
       if (args.trip_id && resolvedTrip) {
-        const roadBlockLocation = eventData.metadata?.location || '';
-        const avoidHighways = /highway|nh\s*\d+/i.test(roadBlockLocation);
-        await executeRecalculateCurrentRoute(db, args.trip_id, args.reason, { avoidHighways });
+        // Halt the truck first if it's still moving
+        await db.ref(`/trips/${args.trip_id}`).update({
+          status: "WAITING", wait_reason: `Computing alternative route: ${args.reason}`, simulator_active: null
+        });
+        await executeRecalculateCurrentRoute(db, args.trip_id, args.reason);
       }
     } else if (actionName === "reroute_to_alternate_pickup") {
       await executeReroute(db, args.trip_id, args.new_destination_id, args.reason);
@@ -718,7 +879,7 @@ async function executeReturnToOrigin(db, tripId, reason) {
   }
 }
 
-async function executeRecalculateCurrentRoute(db, tripId, reason, routeModifiers = {}) {
+async function executeRecalculateCurrentRoute(db, tripId, reason) {
   try {
     const tripSnap = await db.ref(`/trips/${tripId}`).get();
     const trip = tripSnap.val();
@@ -727,14 +888,16 @@ async function executeRecalculateCurrentRoute(db, tripId, reason, routeModifiers
     const origin = trip.current_location;
     const dest = trip.waypoints[trip.waypoints.length - 1]; // Current final destination
 
+    console.log(`[executeRecalculateCurrentRoute] Computing alternative routes from [${origin.lat},${origin.lng}] to [${dest.lat},${dest.lng}]`);
+
     const response = await axios.post(
       'https://routes.googleapis.com/directions/v2:computeRoutes',
       {
         origin: { location: { latLng: { latitude: origin.lat, longitude: origin.lng } } },
         destination: { location: { latLng: { latitude: dest.lat, longitude: dest.lng } } },
         travelMode: "DRIVE",
-        routingPreference: "TRAFFIC_AWARE",
-        routeModifiers
+        routingPreference: "TRAFFIC_AWARE_OPTIMAL",
+        computeAlternativeRoutes: true // Request alternative routes to avoid the blocked path
       },
       {
         headers: {
@@ -745,18 +908,43 @@ async function executeRecalculateCurrentRoute(db, tripId, reason, routeModifiers
       }
     );
 
-    const route = response.data.routes[0];
+    const routes = response.data.routes || [];
+    console.log(`[executeRecalculateCurrentRoute] Received ${routes.length} route(s) from API.`);
+
+    // Pick the ALTERNATIVE route (routes[1]) if available, otherwise fall back to routes[0]
+    // routes[0] is the fastest/default (likely goes through the blocked road)
+    // routes[1] is the best alternative that takes a different path
+    const selectedRoute = routes.length > 1 ? routes[1] : routes[0];
+    const routeLabel = routes.length > 1 ? 'ALTERNATIVE (routes[1])' : 'PRIMARY (only route available)';
+
+    if (!selectedRoute) {
+      console.error(`[executeRecalculateCurrentRoute] No routes returned for ${tripId}.`);
+      await db.ref(`/trips/${tripId}`).update({
+        status: "WAITING", last_reason: reason + ' — No alternative route found, manual intervention needed.',
+        simulator_active: null
+      });
+      return;
+    }
+
+    console.log(`[executeRecalculateCurrentRoute] Selected ${routeLabel} — Distance: ${selectedRoute.distanceMeters}m, Duration: ${selectedRoute.duration}`);
+
     await db.ref(`/trips/${tripId}`).update({
       status: "EN_ROUTE",
-      encoded_polyline: route.polyline.encodedPolyline,
+      encoded_polyline: selectedRoute.polyline.encodedPolyline,
       current_step: 0, // Force simulator reset
-      eta: route.duration,
+      eta: selectedRoute.duration,
       last_reason: reason,
-      simulator_active: null
+      simulator_active: null,
+      reroute_type: routeLabel
     });
-    console.log(`[executeRecalculateCurrentRoute] Successfully bypassed blockage for ${tripId}.`);
+    console.log(`[executeRecalculateCurrentRoute] Successfully bypassed blockage for ${tripId} using ${routeLabel}.`);
   } catch (e) {
     console.error('[executeRecalculateCurrentRoute] Failed:', e.message);
+    // If routing fails, leave trip in WAITING so it doesn't get stuck
+    await db.ref(`/trips/${tripId}`).update({
+      status: "WAITING", last_reason: reason + ` — Route calculation failed: ${e.message}`,
+      simulator_active: null
+    }).catch(() => {});
   }
 }
 

@@ -230,6 +230,7 @@ export default function CreateTripPage() {
                   <option value="VACCINES">Vaccines (Strict Temp 2-8°C)</option>
                   <option value="FROZEN_FOOD">Frozen Food (-18°C)</option>
                   <option value="PRODUCE">Fresh Produce (4-10°C)</option>
+                  <option value="NORMAL_PACKAGE">📦 Normal Package (No Temp Control)</option>
                 </select>
               </div>
             </div>

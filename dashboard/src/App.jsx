@@ -1,6 +1,6 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
-import { Map, ServerIcon, Route as RouteIcon, AlertTriangle, LogOut } from 'lucide-react';
+import { Map, ServerIcon, Route as RouteIcon, AlertTriangle, LogOut, Activity } from 'lucide-react';
 import { useAuth } from './context/AuthContext';
 import { auth } from './api/firebaseConfig';
 import { signOut } from 'firebase/auth';
@@ -11,6 +11,7 @@ import MapPage from './pages/MapPage';
 import InfraPage from './pages/InfraPage';
 import CreateTripPage from './pages/CreateTripPage';
 import ChaosPage from './pages/ChaosPage';
+import SimulationPage from './pages/SimulationPage';
 import GlobalAlertBanner from './components/GlobalAlertBanner';
 
 function Sidebar() {
@@ -27,7 +28,8 @@ function Sidebar() {
     { path: '/map', label: 'Live Map', icon: Map },
     { path: '/infrastructure', label: 'Infrastructure', icon: ServerIcon },
     { path: '/trips/create', label: 'Create Trip', icon: RouteIcon },
-    { path: '/chaos', label: 'Chaos Panel', icon: AlertTriangle }
+    { path: '/chaos', label: 'Chaos Panel', icon: AlertTriangle },
+    { path: '/simulations', label: 'Simulations', icon: Activity }
   ];
 
   return (
@@ -111,6 +113,14 @@ export default function App() {
               element={
                 <ProtectedRoute adminOnly={true}>
                   <ChaosPage />
+                </ProtectedRoute>
+              } 
+            />
+            <Route 
+              path="/simulations" 
+              element={
+                <ProtectedRoute adminOnly={true}>
+                  <SimulationPage />
                 </ProtectedRoute>
               } 
             />

@@ -1,10 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { GoogleMap, Polyline, Marker, InfoWindow, useJsApiLoader } from '@react-google-maps/api';
 import { ref, onValue } from 'firebase/database';
 import { httpsCallable } from 'firebase/functions';
 import { db, functions } from '../api/firebaseConfig';
-import { motion } from 'framer-motion';
-import { Skull, Play, Brain } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Skull, Play, Brain, CheckCircle, XCircle } from 'lucide-react';
 
 const containerStyle = { width: '100%', height: '100%', borderRadius: '12px' };
 const center = { lat: 12.9716, lng: 77.5946 };
@@ -45,6 +45,12 @@ export default function MapPage() {
   const [agentLogs, setAgentLogs] = useState({});
   const [selectedTrip, setSelectedTrip] = useState(null);
   const [actionLoading, setActionLoading] = useState(null);
+  const [toast, setToast] = useState(null);
+
+  const showToast = useCallback((message, type = 'info') => {
+    setToast({ message, type, id: Date.now() });
+    setTimeout(() => setToast(null), 4000);
+  }, []);
 
   useEffect(() => {
     const unsubTrips = onValue(ref(db, 'trips'), (s) => setTrips(s.val() || {}));
@@ -60,18 +66,22 @@ export default function MapPage() {
   const handleKillTrip = async (tripId) => {
     if (!window.confirm(`Kill trip ${tripId.substring(0,8)}...?`)) return;
     setActionLoading(tripId);
-    try { await httpsCallable(functions, 'killTrip')({ trip_id: tripId }); }
-    catch (err) { alert('Failed: ' + err.message); }
-    finally { setActionLoading(null); }
+    try {
+      await httpsCallable(functions, 'killTrip')({ trip_id: tripId });
+      showToast(`Trip ${tripId.substring(0,8)}… terminated successfully.`, 'success');
+    } catch (err) {
+      showToast('Failed: ' + err.message, 'error');
+    } finally { setActionLoading(null); }
   };
 
   const handleStartSim = async (tripId) => {
     setActionLoading(tripId);
     try {
       const res = await httpsCallable(functions, 'startTripSimulation')({ trip_id: tripId });
-      alert(res.data.message);
-    } catch (err) { alert('Failed: ' + err.message); }
-    finally { setActionLoading(null); }
+      showToast(res.data.message, 'success');
+    } catch (err) {
+      showToast('Failed: ' + err.message, 'error');
+    } finally { setActionLoading(null); }
   };
 
   // Separate trips — KILLED trips are hidden from the map entirely
@@ -88,7 +98,35 @@ export default function MapPage() {
   if (!isLoaded) return <div className="glass-panel" style={{ padding: '2rem', textAlign: 'center' }}>Loading Maps...</div>;
 
   return (
-    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} style={{ position: 'relative' }}>
+      {/* Toast Notification */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            key={toast.id}
+            initial={{ opacity: 0, y: -20, x: '-50%' }}
+            animate={{ opacity: 1, y: 0, x: '-50%' }}
+            exit={{ opacity: 0, y: -20, x: '-50%' }}
+            style={{
+              position: 'fixed', top: '1.5rem', left: '50%',
+              zIndex: 9999, padding: '0.85rem 1.5rem', borderRadius: '12px',
+              display: 'flex', alignItems: 'center', gap: '0.6rem',
+              fontSize: '0.88rem', fontWeight: 600,
+              backdropFilter: 'blur(16px)', boxShadow: '0 8px 32px rgba(0,0,0,0.3)',
+              background: toast.type === 'success'
+                ? 'linear-gradient(135deg, rgba(34,197,94,0.15), rgba(34,197,94,0.08))'
+                : toast.type === 'error'
+                  ? 'linear-gradient(135deg, rgba(239,68,68,0.15), rgba(239,68,68,0.08))'
+                  : 'linear-gradient(135deg, rgba(59,130,246,0.15), rgba(59,130,246,0.08))',
+              border: `1px solid ${toast.type === 'success' ? 'rgba(34,197,94,0.3)' : toast.type === 'error' ? 'rgba(239,68,68,0.3)' : 'rgba(59,130,246,0.3)'}`,
+              color: toast.type === 'success' ? '#4ade80' : toast.type === 'error' ? '#f87171' : '#60a5fa'
+            }}
+          >
+            {toast.type === 'success' ? <CheckCircle size={18} /> : toast.type === 'error' ? <XCircle size={18} /> : null}
+            {toast.message}
+          </motion.div>
+        )}
+      </AnimatePresence>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
         <h1>Live Command Center</h1>
         <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
