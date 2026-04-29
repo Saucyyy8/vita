@@ -318,7 +318,7 @@ curl -X POST https://us-central1-keen-proton-493005-c7.cloudfunctions.net/sensor
 
 ## 📝 License
 
-This project was built for the **Google Solution Challenge 2025**.
+This project was built for the **Google Solution Challenge 2026**.
 
 ---
 
